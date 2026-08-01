@@ -1,20 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { db } from '@/lib/firebase';
+import { collection, getDocs, doc, setDoc, query, orderBy } from 'firebase/firestore';
 
 // 학생 전체 명단 조회
 export async function GET() {
   try {
-    const { data, error } = await supabase
-      .from('students')
-      .select('*')
-      .order('student_id', { ascending: true });
+    const studentsCol = collection(db, 'students');
+    const q = query(studentsCol, orderBy('student_id', 'asc'));
+    const snapshot = await getDocs(q);
 
-    if (error) {
-      // Supabase 미연동 환경 픽스 또는 폴백
-      return NextResponse.json({ success: true, students: [], isFallback: true });
-    }
+    const students: any[] = [];
+    snapshot.forEach((docSnap) => {
+      students.push({ id: docSnap.id, ...docSnap.data() });
+    });
 
-    return NextResponse.json({ success: true, students: data });
+    return NextResponse.json({ success: true, students });
   } catch (err: any) {
     return NextResponse.json({ success: false, error: err.message }, { status: 500 });
   }
@@ -30,23 +30,24 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: '유효한 학생 데이터가 없습니다.' }, { status: 400 });
     }
 
-    // Supabase Upsert (학번 중복시 이름 업데이트)
-    const { data, error } = await supabase
-      .from('students')
-      .upsert(
-        students.map(s => ({
-          student_id: String(s.student_id).trim(),
-          name: String(s.name).trim(),
-        })),
-        { onConflict: 'student_id' }
-      )
-      .select();
+    // Firestore batch or setDoc loop (document id = student_id)
+    let count = 0;
+    for (const s of students) {
+      const studentIdClean = String(s.student_id).trim();
+      const nameClean = String(s.name).trim();
 
-    if (error) {
-      return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+      if (studentIdClean && nameClean) {
+        const studentRef = doc(db, 'students', studentIdClean);
+        await setDoc(studentRef, {
+          student_id: studentIdClean,
+          name: nameClean,
+          updated_at: new Date().toISOString(),
+        }, { merge: true });
+        count++;
+      }
     }
 
-    return NextResponse.json({ success: true, count: data?.length || students.length });
+    return NextResponse.json({ success: true, count });
   } catch (err: any) {
     return NextResponse.json({ success: false, error: err.message }, { status: 500 });
   }

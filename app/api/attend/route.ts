@@ -1,5 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { db } from '@/lib/firebase';
+import { 
+  collection, 
+  getDocs, 
+  doc, 
+  getDoc, 
+  setDoc, 
+  query, 
+  where, 
+  orderBy 
+} from 'firebase/firestore';
 
 // 지정한 날짜의 출석 정보 & 전체 학생 통합 목록 조회
 export async function GET(req: NextRequest) {
@@ -8,36 +18,29 @@ export async function GET(req: NextRequest) {
     const dateParam = searchParams.get('date') || new Date().toISOString().split('T')[0];
 
     // 1. 전체 학생 명단 불러오기
-    const { data: students, error: studentErr } = await supabase
-      .from('students')
-      .select('*')
-      .order('student_id', { ascending: true });
+    const studentsCol = collection(db, 'students');
+    const studentQuery = query(studentsCol, orderBy('student_id', 'asc'));
+    const studentSnap = await getDocs(studentQuery);
 
-    // 2. 해당 날짜 출석 기록 불러오기
-    const { data: attendanceRecords, error: attendErr } = await supabase
-      .from('attendance')
-      .select('*')
-      .eq('date', dateParam);
-
-    if (studentErr || attendErr) {
-      // Supabase 미설치 또는 연결 미작동시 폴백 Response
-      return NextResponse.json({
-        success: true,
-        date: dateParam,
-        summary: { total: 0, present: 0, absent: 0 },
-        list: [],
-      });
-    }
-
-    // 출석 Map 생성 (key: student_id)
-    const attendMap = new Map();
-    (attendanceRecords || []).forEach((rec: any) => {
-      attendMap.set(rec.student_id, rec);
+    const students: any[] = [];
+    studentSnap.forEach((docSnap) => {
+      students.push({ id: docSnap.id, ...docSnap.data() });
     });
 
-    // 전체 학생 대비 출석 현황 가공
+    // 2. 해당 날짜의 출석 기록 불러오기
+    const attendanceCol = collection(db, 'attendance');
+    const attendQuery = query(attendanceCol, where('date', '==', dateParam));
+    const attendSnap = await getDocs(attendQuery);
+
+    const attendMap = new Map();
+    attendSnap.forEach((docSnap) => {
+      const data = docSnap.data();
+      attendMap.set(data.student_id, data);
+    });
+
+    // 3. 전체 학생 대비 출석 현황 매핑
     let presentCount = 0;
-    const combinedList = (students || []).map((student: any) => {
+    const combinedList = students.map((student) => {
       const record = attendMap.get(student.student_id);
       const isPresent = !!record;
       if (isPresent) presentCount++;
@@ -55,9 +58,9 @@ export async function GET(req: NextRequest) {
       success: true,
       date: dateParam,
       summary: {
-        total: students?.length || 0,
+        total: students.length,
         present: presentCount,
-        absent: (students?.length || 0) - presentCount,
+        absent: students.length - presentCount,
       },
       list: combinedList,
     });
@@ -82,63 +85,53 @@ export async function POST(req: NextRequest) {
     const cleanStudentId = String(student_id).trim();
     const cleanName = String(name).trim();
     const today = new Date().toISOString().split('T')[0];
+    const nowIso = new Date().toISOString();
 
-    // 1. 학생 명단에 존재하는지 확인 (없다면 자동 생성 또는 연동)
-    const { data: studentData } = await supabase
-      .from('students')
-      .select('*')
-      .eq('student_id', cleanStudentId)
-      .single();
+    // 1. 학생 명단에 존재하는지 확인 (없으면 자동으로 학생 목록에 추가)
+    const studentRef = doc(db, 'students', cleanStudentId);
+    const studentSnap = await getDoc(studentRef);
 
-    if (!studentData) {
-      // 명단에 없는 학번이라도 자동 등록 처리하여 편의 제공
-      await supabase.from('students').insert([
-        { student_id: cleanStudentId, name: cleanName }
-      ]);
+    if (!studentSnap.exists()) {
+      await setDoc(studentRef, {
+        student_id: cleanStudentId,
+        name: cleanName,
+        created_at: nowIso,
+      });
     }
 
-    // 2. 당일 중복 출석 확인
-    const { data: existingAttend } = await supabase
-      .from('attendance')
-      .select('*')
-      .eq('student_id', cleanStudentId)
-      .eq('date', today)
-      .single();
+    // 2. 당일 중복 출석 확인 (문서 ID: TODAY_STUDENTID)
+    const attendDocId = `${today}_${cleanStudentId}`;
+    const attendRef = doc(db, 'attendance', attendDocId);
+    const attendSnap = await getDoc(attendRef);
 
-    if (existingAttend) {
+    if (attendSnap.exists()) {
+      const existingData = attendSnap.data();
       return NextResponse.json(
         {
           success: false,
           code: 'ALREADY_CHECKED',
           message: `${cleanName} 학생은 이미 오늘(${today}) 출석 체크가 완료되었습니다.`,
-          timestamp: existingAttend.timestamp,
+          timestamp: existingData.timestamp,
         },
         { status: 409 }
       );
     }
 
     // 3. 출석 데이터 저장
-    const { data: inserted, error: insertErr } = await supabase
-      .from('attendance')
-      .insert([
-        {
-          student_id: cleanStudentId,
-          name: cleanName,
-          date: today,
-          status: 'PRESENT',
-        },
-      ])
-      .select()
-      .single();
+    const newRecord = {
+      student_id: cleanStudentId,
+      name: cleanName,
+      date: today,
+      timestamp: nowIso,
+      status: 'PRESENT',
+    };
 
-    if (insertErr) {
-      return NextResponse.json({ success: false, error: insertErr.message }, { status: 500 });
-    }
+    await setDoc(attendRef, newRecord);
 
     return NextResponse.json({
       success: true,
       message: '출석이 성공적으로 완료되었습니다!',
-      record: inserted,
+      record: newRecord,
     });
   } catch (err: any) {
     return NextResponse.json({ success: false, error: err.message }, { status: 500 });
